@@ -1,0 +1,18 @@
+[package]
+name = "tibet-store-mmu"
+version = "0.1.0"
+edition = "2021"
+description = "MMU Illusion — userfaultfd proof-of-concept for transparent RAM virtualization"
+license = "MIT"
+authors = ["Gemini <gemini.aint>", "Jasper van de Meent <jasper@humotica.com>"]
+publish = false  # PoC — niet publiceren
+
+[dependencies]
+userfaultfd = "0.8.1"
+libc = "0.2"
+zstd = "0.13"
+tokio = { version = "1.0", features = ["full"] }
+
+[[bench]]
+name = "mmu_bench"
+harness = false
