@@ -6,6 +6,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use userfaultfd::{Uffd, UffdBuilder, Event};
 
+// Bifurcation — encrypt-by-default
+use tibet_trust_kernel::bifurcation::{
+    AirlockBifurcation, BifurcationResult, ClearanceLevel, EncryptedBlock, JisClaim,
+};
+
 /// TIBET-Store MMU — Transparante Geheugen-Virtualisatie
 ///
 /// Gemini's bewezen concept, verfijnd tot een meetbare library:
@@ -40,6 +45,34 @@ pub enum FillMode {
     StaticData { payload: Vec<u8> },
     /// Simulated .tza restore (zstd decompress simulation)
     CompressedRestore,
+    /// Encrypted restore via Airlock Bifurcation
+    /// Page data is AES-256-GCM sealed. On fault: open(block, claim) → plaintext → inject.
+    /// Geen JIS claim = dood materiaal (zero page).
+    EncryptedRestore {
+        /// Pre-sealed blocks, indexed by page number
+        sealed_pages: Vec<EncryptedBlock>,
+        /// JIS claim for decryption — identity IS the key
+        claim: JisClaim,
+        /// Clearance level used for sealing
+        clearance: ClearanceLevel,
+    },
+    /// Compressed + Encrypted restore — de productie-modus.
+    ///
+    /// plaintext → zstd compress → AES-256-GCM seal → stored
+    /// On fault: open → zstd decompress → inject
+    ///
+    /// Kleiner EN veiliger. Compressie reduceert I/O, encryptie beschermt data.
+    /// Netto effect: sneller dan raw plaintext voor compressible data.
+    CompressedEncryptedRestore {
+        /// Pre-compressed + sealed blocks, indexed by page number
+        sealed_pages: Vec<EncryptedBlock>,
+        /// Original (uncompressed) page sizes for verification
+        original_sizes: Vec<usize>,
+        /// JIS claim for decryption
+        claim: JisClaim,
+        /// Clearance level
+        clearance: ClearanceLevel,
+    },
 }
 
 /// Stats from the MMU handler.
@@ -157,8 +190,14 @@ impl MmuArena {
         let hr = handler_ready.clone();
         let fill_mode = config.fill_mode;
 
+        // Clone arena base address for page index calculation in handler
+        let arena_base = addr as usize;
+
         let handler_thread = thread::spawn(move || {
             let mut latencies: Vec<u64> = Vec::new();
+
+            // Archivaris engine — lives in handler thread, owns the decryption keys
+            let mut engine = AirlockBifurcation::new();
 
             // Signal that handler is ready to receive faults
             hr.store(true, Ordering::Release);
@@ -182,6 +221,7 @@ impl MmuArena {
                     Ok(Some(Event::Pagefault { addr: fault_addr, .. })) => {
                         let t0 = Instant::now();
                         let aligned = (fault_addr as usize / page_size) * page_size;
+                        let page_index = (aligned - arena_base) / page_size;
 
                         pf.fetch_add(1, Ordering::Relaxed);
 
@@ -197,17 +237,80 @@ impl MmuArena {
                                 page
                             }
                             FillMode::CompressedRestore => {
-                                // Simulate .tza restore:
-                                //   1. "Load" compressed block (~page_size/4 bytes)
-                                //   2. "Decompress" with zstd (~1ns/byte output)
-                                //   3. "Verify" Ed25519 signature
-                                //   4. Build output page
                                 let mut page = vec![0u8; page_size];
-                                // Write a marker so we can verify the restore worked
                                 let marker = format!("TZA_RESTORED:page@{:#x}", aligned);
                                 let marker_bytes = marker.as_bytes();
                                 page[..marker_bytes.len()].copy_from_slice(marker_bytes);
                                 page
+                            }
+                            FillMode::EncryptedRestore { sealed_pages, claim, .. } => {
+                                // ═══════════════════════════════════════════
+                                // SPACESHUTTLE: Encrypted Page Fault Handler
+                                //
+                                // Page fault → lookup sealed block → bifurcation.open()
+                                //   → JIS clearance check → AES-256-GCM decrypt
+                                //   → plaintext → inject in page → app resumes
+                                //
+                                // Geen JIS claim = dood materiaal (zero page)
+                                // Identity IS the memory.
+                                // ═══════════════════════════════════════════
+                                if page_index < sealed_pages.len() {
+                                    match engine.open(&sealed_pages[page_index], claim) {
+                                        BifurcationResult::Opened { plaintext, .. } => {
+                                            let mut page = vec![0u8; page_size];
+                                            let copy_len = plaintext.len().min(page_size);
+                                            page[..copy_len].copy_from_slice(&plaintext[..copy_len]);
+                                            page
+                                        }
+                                        BifurcationResult::AccessDenied { .. } => {
+                                            vec![0u8; page_size]
+                                        }
+                                        _ => {
+                                            vec![0u8; page_size]
+                                        }
+                                    }
+                                } else {
+                                    vec![0u8; page_size]
+                                }
+                            }
+                            FillMode::CompressedEncryptedRestore { sealed_pages, claim, .. } => {
+                                // ═══════════════════════════════════════════
+                                // SPACESHUTTLE v2: Compressed + Encrypted
+                                //
+                                // Page fault → open(block) → AES-256-GCM decrypt
+                                //   → zstd decompress → full page → inject
+                                //
+                                // Stored: ~1-2KB per 4KB page (compressible data)
+                                // Decrypted: on-demand, per page fault
+                                // Net effect: less I/O, less bandwidth, same security
+                                // ═══════════════════════════════════════════
+                                if page_index < sealed_pages.len() {
+                                    match engine.open(&sealed_pages[page_index], claim) {
+                                        BifurcationResult::Opened { plaintext, .. } => {
+                                            // plaintext = zstd compressed data → decompress
+                                            match zstd::decode_all(plaintext.as_slice()) {
+                                                Ok(decompressed) => {
+                                                    let mut page = vec![0u8; page_size];
+                                                    let copy_len = decompressed.len().min(page_size);
+                                                    page[..copy_len].copy_from_slice(&decompressed[..copy_len]);
+                                                    page
+                                                }
+                                                Err(_) => {
+                                                    // Decompressie mislukt — dood materiaal
+                                                    vec![0u8; page_size]
+                                                }
+                                            }
+                                        }
+                                        BifurcationResult::AccessDenied { .. } => {
+                                            vec![0u8; page_size]
+                                        }
+                                        _ => {
+                                            vec![0u8; page_size]
+                                        }
+                                    }
+                                } else {
+                                    vec![0u8; page_size]
+                                }
                             }
                         };
 
@@ -390,6 +493,106 @@ pub fn userfaultfd_available() -> bool {
     {
         Ok(_) => true,
         Err(_) => false,
+    }
+}
+
+/// Pre-seal page data into encrypted blocks for EncryptedRestore mode.
+///
+/// Takes a slice of page-sized plaintext buffers and seals each one
+/// using session keys (fast path: HKDF+AES only after first DH).
+///
+/// Returns the sealed blocks ready for the page fault handler.
+pub fn seal_pages(
+    pages: &[Vec<u8>],
+    clearance: ClearanceLevel,
+    source: &str,
+) -> Vec<EncryptedBlock> {
+    let mut engine = AirlockBifurcation::new();
+    let mut blocks = Vec::with_capacity(pages.len());
+    for (i, page_data) in pages.iter().enumerate() {
+        if let BifurcationResult::Sealed { block, .. } =
+            engine.seal_session(page_data, i, clearance.clone(), source)
+        {
+            blocks.push(block);
+        }
+    }
+    blocks
+}
+
+/// Compressed seal result with storage statistics.
+pub struct CompressedSealResult {
+    pub blocks: Vec<EncryptedBlock>,
+    pub original_sizes: Vec<usize>,
+    pub total_original: usize,
+    pub total_compressed: usize,
+    pub total_encrypted: usize,
+    pub compression_ratio: f64,
+}
+
+/// Pre-compress + seal page data for CompressedEncryptedRestore mode.
+///
+/// Pipeline per page: plaintext → zstd (level 3) → AES-256-GCM seal
+///
+/// Returns sealed blocks + compression statistics.
+pub fn seal_pages_compressed(
+    pages: &[Vec<u8>],
+    clearance: ClearanceLevel,
+    source: &str,
+    zstd_level: i32,
+) -> CompressedSealResult {
+    let mut engine = AirlockBifurcation::new();
+    let mut blocks = Vec::with_capacity(pages.len());
+    let mut original_sizes = Vec::with_capacity(pages.len());
+    let mut total_original = 0usize;
+    let mut total_compressed = 0usize;
+    let mut total_encrypted = 0usize;
+
+    for (i, page_data) in pages.iter().enumerate() {
+        let original_size = page_data.len();
+        total_original += original_size;
+
+        // Step 1: zstd compress
+        let compressed = zstd::encode_all(page_data.as_slice(), zstd_level)
+            .unwrap_or_else(|_| page_data.clone()); // fallback to raw on compress failure
+        total_compressed += compressed.len();
+
+        // Step 2: AES-256-GCM seal the compressed data
+        if let BifurcationResult::Sealed { block, .. } =
+            engine.seal_session(&compressed, i, clearance.clone(), source)
+        {
+            total_encrypted += block.ciphertext.len();
+            blocks.push(block);
+        }
+
+        original_sizes.push(original_size);
+    }
+
+    let compression_ratio = if total_compressed > 0 {
+        total_original as f64 / total_compressed as f64
+    } else {
+        1.0
+    };
+
+    CompressedSealResult {
+        blocks,
+        original_sizes,
+        total_original,
+        total_compressed,
+        total_encrypted,
+        compression_ratio,
+    }
+}
+
+/// Create a JIS claim for MMU access.
+pub fn mmu_claim(identity: &str, clearance: ClearanceLevel) -> JisClaim {
+    JisClaim {
+        identity: identity.to_string(),
+        ed25519_pub: "a".repeat(64), // Placeholder — real impl uses actual key
+        clearance,
+        role: "operator".to_string(),
+        dept: "kernel".to_string(),
+        claimed_at: "2026-04-15T00:00:00Z".to_string(),
+        signature: "mmu_sig".to_string(),
     }
 }
 
